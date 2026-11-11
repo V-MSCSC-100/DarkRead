@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DarkRead</title>
+<style>
+  :root { --bg:#121212; --bar:#1e1e1e; --fg:#e8e8e8; --accent:#8ab4f8; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px system-ui,sans-serif; transition:background .2s; }
+  body.light { --bg:#e9e9e9; --bar:#fff; --fg:#222; --accent:#1a73e8; }
+  #bar { position:sticky; top:0; z-index:10; display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+         padding:10px 16px; background:var(--bar); border-bottom:1px solid #8884; }
+  #bar label { display:flex; flex-direction:column; font-size:11px; gap:2px; opacity:.9; }
+  input[type=range] { width:110px; accent-color:var(--accent); }
+  button, .btn { background:var(--accent); color:#000; border:0; border-radius:6px; padding:7px 12px; cursor:pointer; font-weight:600; }
+  button.ghost { background:#8883; color:var(--fg); }
+  #file { display:none; }
+  #drop { margin:12vh auto; max-width:480px; text-align:center; padding:48px; border:2px dashed #8886; border-radius:16px; }
+  #drop.over { border-color:var(--accent); }
+  #view { display:flex; flex-direction:column; align-items:center; gap:16px; padding:20px; transition:filter .15s; }
+  #view canvas, #view img { max-width:none; box-shadow:0 2px 12px #0006; background:#fff; }
+  #view .doc { background:#fff; color:#000; width:min(820px,100%); padding:48px 56px; line-height:1.6;
+               box-shadow:0 2px 12px #0006; white-space:pre-wrap; overflow-wrap:anywhere; }
+  #view .doc.html { white-space:normal; }
+  #view .doc table { border-collapse:collapse; } #view .doc td, #view .doc th { border:1px solid #888; padding:4px 8px; }
+  #status { font-size:12px; opacity:.7; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label class="btn" for="file" style="flex-direction:row;cursor:pointer">Open file</label>
+  <input type="file" id="file" accept=".pdf,.docx,.txt,.md,.html,.png,.jpg,.jpeg,.webp,.gif">
+  <button id="mode" class="ghost" title="Shortcut: D">Mode: Dark</button>
+  <label>Sepia <input type="range" id="sepia" min="0" max="100" value="0"></label>
+  <label>Brightness <input type="range" id="bright" min="40" max="130" value="90"></label>
+  <label>Contrast <input type="range" id="contrast" min="60" max="140" value="95"></label>
+  <label>Zoom <input type="range" id="zoom" min="50" max="300" value="130"></label>
+  <button id="reset" class="ghost">Reset</button>
+  <span id="status"></span>
+</div>
+
+<div id="drop">Drop a PDF, DOCX, TXT, MD, HTML or image here<br><small>or click “Open file”</small></div>
+<div id="view"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const view = $('view'), status = $('status');
+const DEFAULTS = { dark:true, sepia:0, bright:90, contrast:95, zoom:130 };
+let S = { ...DEFAULTS, ...JSON.parse(localStorage.getItem('darkread') || '{}') };
+let pdfDoc = null, renderToken = 0;
+
+// PDF.js worker via blob (avoids cross-origin worker errors on file:// and localhost)
+const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+const workerReady = fetch(PDFJS + 'pdf.worker.min.js').then(r => r.text()).then(t => {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([t], { type:'text/javascript' }));
+});
+
+function applyStyle() {
+  document.body.classList.toggle('light', !S.dark);
+  // Dark: invert + hue-rotate keeps colours roughly correct. Sepia is applied after.
+  view.style.filter = (S.dark ? 'invert(1) hue-rotate(180deg) ' : '') +
+    `sepia(${S.sepia}%) brightness(${S.bright}%) contrast(${S.contrast}%)`;
+  $('mode').textContent = 'Mode: ' + (S.dark ? 'Dark' : 'Light');
+  $('sepia').value = S.sepia; $('bright').value = S.bright;
+  $('contrast').value = S.contrast; $('zoom').value = S.zoom;
+  localStorage.setItem('darkread', JSON.stringify(S));
+}
+
+$('mode').onclick = () => { S.dark = !S.dark; applyStyle(); };
+document.addEventListener('keydown', e => { if (e.key.toLowerCase()==='d' && e.target.tagName!=='INPUT') $('mode').click(); });
+['sepia','bright','contrast'].forEach(k => $(k).oninput = e => { S[k] = +e.target.value; applyStyle(); });
+let zt; $('zoom').oninput = e => { S.zoom = +e.target.value; applyStyle(); clearTimeout(zt); zt = setTimeout(() => pdfDoc && renderPdf(), 200); };
+$('reset').onclick = () => { S = { ...DEFAULTS }; applyStyle(); pdfDoc && renderPdf(); };
+
+async function renderPdf() {
+  const token = ++renderToken;
+  view.innerHTML = '';
+  const dpr = window.devicePixelRatio || 1, scale = S.zoom / 100;
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    if (token !== renderToken) return;
+    const vp = page.getViewport({ scale: scale * dpr });
+    const c = document.createElement('canvas');
+    c.width = vp.width; c.height = vp.height;
+    c.style.width = vp.width / dpr + 'px'; c.style.height = vp.height / dpr + 'px';
+    view.appendChild(c);
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    status.textContent = `Page ${i}/${pdfDoc.numPages}`;
+  }
+  status.textContent = `${pdfDoc.numPages} pages`;
+}
+
+function addDoc(html, isHtml) {
+  const d = document.createElement('div');
+  d.className = 'doc' + (isHtml ? ' html' : '');
+  isHtml ? d.innerHTML = html : d.textContent = html;
+  view.appendChild(d);
+}
+
+async function openFile(file) {
+  if (!file) return;
+  $('drop').style.display = 'none';
+  view.innerHTML = ''; pdfDoc = null; renderToken++;
+  status.textContent = file.name;
+  const ext = file.name.split('.').pop().toLowerCase();
+  try {
+    if (ext === 'pdf') {
+      await workerReady;
+      pdfDoc = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+      await renderPdf();
+    } else if (ext === 'docx') {
+      const r = await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() });
+      addDoc(r.value, true);
+    } else if (file.type.startsWith('image/')) {
+      const img = new Image(); img.src = URL.createObjectURL(file); view.appendChild(img);
+    } else if (ext === 'html') {
+      addDoc(await file.text(), true);
+    } else {
+      addDoc(await file.text(), false);
+    }
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+    console.error(err);
+  }
+}
+
+$('file').onchange = e => openFile(e.target.files[0]);
+const drop = $('drop');
+['dragover','dragenter'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+document.addEventListener('drop', e => openFile(e.dataTransfer.files[0]));
+
+applyStyle();
+</script>
+</body>
+</html>
